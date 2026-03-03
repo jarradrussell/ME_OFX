@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(ME_OpenDRT VERSION 1.2.0 LANGUAGES CXX)
+project(ME_OpenDRT VERSION 1.2.1 LANGUAGES CXX)
 
 set(PLUGIN_BASENAME "ME_OpenDRT")
 option(ME_OPENDRT_LINUX_CUDA "Enable CUDA backend on Linux builds" ON)
@@ -201,15 +201,25 @@ set_target_properties(${PLUGIN_BASENAME} PROPERTIES
 
 if(ME_OPENDRT_BUILD_CUBE_VIEWER_STUB)
   find_package(OpenGL REQUIRED)
-  find_package(glfw3 QUIET)
-  if(NOT glfw3_FOUND AND NOT WIN32)
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-      pkg_check_modules(GLFW3 QUIET IMPORTED_TARGET glfw3)
+  option(ME_OPENDRT_VIEWER_FORCE_BUNDLED_GLFW "Use bundled GLFW for Cube Viewer builds" ${APPLE})
+  if(NOT ME_OPENDRT_VIEWER_FORCE_BUNDLED_GLFW)
+    find_package(glfw3 QUIET)
+    if(NOT glfw3_FOUND AND NOT WIN32)
+      find_package(PkgConfig QUIET)
+      if(PkgConfig_FOUND)
+        pkg_check_modules(GLFW3 QUIET IMPORTED_TARGET glfw3)
+      endif()
     endif()
   endif()
-  if(NOT glfw3_FOUND AND NOT TARGET PkgConfig::GLFW3)
+  if(ME_OPENDRT_VIEWER_FORCE_BUNDLED_GLFW OR (NOT glfw3_FOUND AND NOT TARGET PkgConfig::GLFW3))
     include(FetchContent)
+    set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+    if(APPLE)
+      set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    endif()
     FetchContent_Declare(
       glfw
       GIT_REPOSITORY https://github.com/glfw/glfw.git
@@ -258,6 +268,7 @@ if(ME_OPENDRT_BUILD_CUBE_VIEWER_STUB)
     RUNTIME_OUTPUT_DIRECTORY_RELEASE "${OFX_OUTPUT_DIR}"
     RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${OFX_OUTPUT_DIR}"
     RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${OFX_OUTPUT_DIR}"
+    OSX_ARCHITECTURES "${CMAKE_OSX_ARCHITECTURES}"
   )
 endif()
 

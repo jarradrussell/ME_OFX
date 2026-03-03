@@ -359,6 +359,8 @@ bool renderHost(
     int height,
     size_t srcRowBytes,
     size_t dstRowBytes,
+    int originX,
+    int originY,
     const OpenDRTParams& params,
     const OpenDRTDerivedParams& derived,
     void* metalCommandQueue) {
@@ -391,7 +393,27 @@ bool renderHost(
 
   const size_t requiredSrcBytes = srcRowBytes * static_cast<size_t>(height);
   const size_t requiredDstBytes = dstRowBytes * static_cast<size_t>(height);
-  if (srcBuffer.length < requiredSrcBytes || dstBuffer.length < requiredDstBytes) return false;
+  const size_t pixelBytes = 4u * sizeof(float);
+  const bool originValid = (originX >= 0 && originY >= 0);
+  size_t srcOffsetBytes = 0;
+  size_t dstOffsetBytes = 0;
+  if (originValid && (originX > 0 || originY > 0)) {
+    const size_t ox = static_cast<size_t>(originX);
+    const size_t oy = static_cast<size_t>(originY);
+    const size_t srcCandidateOffset = oy * srcRowBytes + ox * pixelBytes;
+    const size_t dstCandidateOffset = oy * dstRowBytes + ox * pixelBytes;
+    // Host implementations differ: some provide a full-frame MTLBuffer, others a tile-local one.
+    // Use the offset only when it clearly fits in the source and destination allocations.
+    if (srcBuffer.length >= srcCandidateOffset + requiredSrcBytes &&
+        dstBuffer.length >= dstCandidateOffset + requiredDstBytes) {
+      srcOffsetBytes = srcCandidateOffset;
+      dstOffsetBytes = dstCandidateOffset;
+    }
+  }
+
+  if (srcBuffer.length < srcOffsetBytes + requiredSrcBytes || dstBuffer.length < dstOffsetBytes + requiredDstBytes) {
+    return false;
+  }
 
   const int srcRowFloats = static_cast<int>(srcRowBytes / sizeof(float));
   const int dstRowFloats = static_cast<int>(dstRowBytes / sizeof(float));
@@ -408,8 +430,8 @@ bool renderHost(
   }
 
   [enc setComputePipelineState:ctx.pipeline];
-  [enc setBuffer:srcBuffer offset:0 atIndex:0];
-  [enc setBuffer:dstBuffer offset:0 atIndex:1];
+  [enc setBuffer:srcBuffer offset:srcOffsetBytes atIndex:0];
+  [enc setBuffer:dstBuffer offset:dstOffsetBytes atIndex:1];
   [enc setBytes:&params length:sizeof(OpenDRTParams) atIndex:2];
   [enc setBytes:&width length:sizeof(int) atIndex:3];
   [enc setBytes:&height length:sizeof(int) atIndex:4];

@@ -10,6 +10,7 @@
 #include <fstream>
 #include <cstdio>
 #include <atomic>
+#include <numeric>
 #include <mutex>
 #include <memory>
 #include <sstream>
@@ -50,7 +51,7 @@ extern char** environ;
 #define kPluginDescription "OpenDRT v1.1.0 by Jed Smith, ported to OFX by Moaz ELgabry"
 #define kPluginIdentifier "com.moazelgabry.me_opendrt"
 #define kPluginVersionMajor 1
-#define kPluginVersionMinor 3
+#define kPluginVersionMinor 2
 
 namespace {
 
@@ -305,7 +306,11 @@ std::vector<std::string> cubeViewerExeCandidates() {
 bool launchCubeViewerProcessAsync(std::string* errorOut, std::string* launchedPathOut, uint32_t* launchedPidOut) {
   const std::vector<std::string> candidates = cubeViewerExeCandidates();
   std::ostringstream attempted;
+#if !defined(_WIN32)
+  std::ostringstream failures;
+#endif
   bool attemptedAny = false;
+  bool spawnAttempted = false;
   for (const std::string& candidate : candidates) {
     if (candidate.empty()) continue;
     const bool literalCandidate = (candidate == cubeViewerExeName());
@@ -343,19 +348,28 @@ bool launchCubeViewerProcessAsync(std::string* errorOut, std::string* launchedPa
 #else
     pid_t pid = 0;
     char* const argv[] = {const_cast<char*>(candidate.c_str()), nullptr};
+    spawnAttempted = true;
     const int rc = posix_spawn(&pid, candidate.c_str(), nullptr, nullptr, argv, environ);
     if (rc == 0) {
       if (launchedPidOut) *launchedPidOut = static_cast<uint32_t>(pid);
       if (launchedPathOut) *launchedPathOut = candidate;
       return true;
     }
+    const char* errText = std::strerror(rc);
+    failures << (failures.tellp() > 0 ? "; " : "") << candidate << " (rc=" << rc;
+    if (errText && errText[0] != '\0') failures << ", " << errText;
+    failures << ")";
     attempted << (attemptedAny ? "; " : "") << candidate << " (err=" << rc << ")";
     attemptedAny = true;
 #endif
   }
   if (errorOut) {
-    if (!attemptedAny) {
+    if (!attemptedAny && !spawnAttempted) {
       *errorOut = "viewer executable not found";
+#if !defined(_WIN32)
+    } else if (spawnAttempted) {
+      *errorOut = std::string("viewer launch failed. attempted: ") + failures.str();
+#endif
     } else {
       *errorOut = std::string("viewer executable not found. attempted: ") + attempted.str();
     }
@@ -2114,7 +2128,15 @@ void render(const OFX::RenderArguments& args) override {
       const size_t dstRowBytes = dstRb < 0 ? static_cast<size_t>(-dstRb) : static_cast<size_t>(dstRb);
       if (srcMetalBuffer != nullptr && dstMetalBuffer != nullptr &&
           processor_->renderMetalHostBuffers(
-              srcMetalBuffer, dstMetalBuffer, width, height, srcRowBytes, dstRowBytes, args.pMetalCmdQ)) {
+              srcMetalBuffer,
+              dstMetalBuffer,
+              width,
+              height,
+              srcRowBytes,
+              dstRowBytes,
+              bounds.x1,
+              bounds.y1,
+              args.pMetalCmdQ)) {
         OpenDRTMetal::resetHostMetalFailureState();
         perfLog("Backend render host Metal", tHostMetal);
         perfLog("Render total", tRenderStart);
@@ -2221,7 +2243,15 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
       if (suppressParamChanged_) {
         return;
       }
-      if (args.reason == OFX::eChangePluginEdit || args.reason == OFX::eChangeTime) {
+      if (args.reason == OFX::eChangeTime) {
+        return;
+      }
+      if (args.reason == OFX::eChangePluginEdit) {
+        if (cubeViewerRequested_ && cubeViewerLive_) {
+          // Host/plugin-driven edits (including host reset flows) should still refresh
+          // the companion viewer so it does not appear disconnected/stale.
+          pushCubeViewerUpdate(args.time, paramName, true);
+        }
         return;
       }
 
@@ -2296,6 +2326,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         const bool preserveCwp = (cwpPreset > 0);
         const TonescalePresetValues preservedTs = preserveTonescale ? captureCurrentTonescaleValues(args.time) : TonescalePresetValues{};
         const int preservedCwp = preserveCwp ? getInt("cwp", args.time, 2) : 2;
+        const float preservedCwpLm = preserveCwp ? getDouble("cwp_lm", args.time, 0.25f) : 0.25f;
         int activeToneUser = -1;
         if (isUserTonescalePresetIndex(tsPreset)) {
           int userToneIdx = -1;
@@ -2323,8 +2354,9 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
           writeTonescaleValuesToParams(preservedTs, *this);
         }
         if (preserveCwp) {
-          // Keep explicit creative-white override; cwp_lm intentionally remains look-driven.
+          // Keep explicit creative-white override and its limit on look switch.
           setInt("cwp", preservedCwp);
+          setDouble("cwp_lm", preservedCwpLm);
         }
         updateToggleVisibility(args.time);
         updatePresetManagerActionState(args.time);
@@ -2368,6 +2400,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         FlagScope scope(suppressParamChanged_);
         if (cwpPreset <= 0) {
           setInt("cwp", selectedLookBaseCwp(args.time));
+          setDouble("cwp_lm", selectedLookBaseCwpLm(args.time));
         } else {
           writeCreativeWhitePresetToParams(cwpPreset, *this);
         }
@@ -2403,6 +2436,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         setChoice("tn_su", expected.tn_su);
         setChoice("display_gamut", expected.display_gamut);
         setChoice("eotf", expected.eotf);
+        setChoice("creativeWhitePreset", 0);
         setInt("cwp", expected.cwp);
         setDouble("cwp_lm", expected.cwp_lm);
         updateToggleVisibility(args.time);
@@ -3083,7 +3117,6 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     const int look = getChoice("lookPreset", time, 0);
     const int tsPreset = getChoice("tonescalePreset", time, 0);
     const int displayPreset = getChoice("displayEncodingPreset", time, 0);
-    const int cwpPreset = getChoice("creativeWhitePreset", time, 0);
     OpenDRTParams out{};
     // Step 1: Start from look baseline (built-in or user look payload).
     if (isUserLookPresetIndex(look)) {
@@ -3120,9 +3153,6 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     // Step 3: Apply display preset defaults.
     applyDisplayEncodingPreset(out, displayPreset);
     out.clamp = 1;
-    // Step 4: Creative-white selector can override look baseline cwp.
-    if (cwpPreset > 0) out.cwp = cwpPreset - 1;
-
     *expected = out;
     return true;
   }
@@ -3209,7 +3239,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
   }
 
   // ===== Dirty-State Evaluation: compare live params against computed baseline =====
-  bool isCurrentEqualToPresetBaseline(double time, bool* tonescaleCleanOut = nullptr) const {
+  bool isCurrentEqualToPresetBaseline(double time, bool* tonescaleCleanOut = nullptr, bool* creativeWhiteCleanOut = nullptr) const {
     OpenDRTParams expected{};
     if (!buildPresetBaseline(time, &expected)) return false;
 
@@ -3229,6 +3259,13 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
       almostEqual(getDouble("tn_lcon_w", time, expected.tn_lcon_w), expected.tn_lcon_w);
 
     if (tonescaleCleanOut) *tonescaleCleanOut = tonescaleClean;
+
+    const bool creativeWhiteClean =
+      (getChoice("creativeWhitePreset", time, 0) == 0) &&
+      (getInt("cwp", time, expected.cwp) == expected.cwp) &&
+      almostEqual(getDouble("cwp_lm", time, expected.cwp_lm), expected.cwp_lm);
+
+    if (creativeWhiteCleanOut) *creativeWhiteCleanOut = creativeWhiteClean;
 
     // Overall "clean" includes all preset-backed advanced controls + display settings + cwp/cwp_lm.
     const bool clean =
@@ -3284,8 +3321,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
       almostEqual(getDouble("hs_m_rng", time, expected.hs_m_rng), expected.hs_m_rng) &&
       almostEqual(getDouble("hs_y", time, expected.hs_y), expected.hs_y) &&
       almostEqual(getDouble("hs_y_rng", time, expected.hs_y_rng), expected.hs_y_rng) &&
-      (getInt("cwp", time, expected.cwp) == expected.cwp) &&
-      almostEqual(getDouble("cwp_lm", time, expected.cwp_lm), expected.cwp_lm) &&
+      creativeWhiteClean &&
       (getBool("clamp", time, expected.clamp) == expected.clamp) &&
       (getChoice("tn_su", time, expected.tn_su) == expected.tn_su) &&
       (getChoice("display_gamut", time, expected.display_gamut) == expected.display_gamut) &&
@@ -3296,15 +3332,16 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
 
   void updatePresetStateFromCurrent(double time) {
     bool tonescaleClean = true;
-    const bool clean = isCurrentEqualToPresetBaseline(time, &tonescaleClean);
+    bool creativeWhiteClean = true;
+    const bool clean = isCurrentEqualToPresetBaseline(time, &tonescaleClean, &creativeWhiteClean);
     // presetState drives UI readout and Discard availability.
     setInt("presetState", clean ? 0 : 1);
     if (auto* p = fetchPushButtonParam("discardPresetChanges")) p->setEnabled(!clean);
     // Export buttons are always available (current-state export model).
     if (auto* p = fetchPushButtonParam("userPresetExportLook")) p->setEnabled(true);
     if (auto* p = fetchPushButtonParam("userPresetExportTonescale")) p->setEnabled(true);
-    // Menu label mutation is separate so users can see "(Modified)" directly in look/tonescale lists.
-    applyPresetMenuModifiedLabels(time, !clean, !tonescaleClean);
+    // Menu label mutation is separate so users can see "(Modified)" directly in selector lists.
+    applyPresetMenuModifiedLabels(time, !clean, !tonescaleClean, !creativeWhiteClean);
   }
 
   // ===== Typed OFX Param Accessors =====
@@ -3359,6 +3396,20 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     }
     if (lookIdx < 0 || lookIdx >= static_cast<int>(kLookPresets.size())) return 2;
     return kLookPresets[static_cast<size_t>(lookIdx)].cwp;
+  }
+
+  float selectedLookBaseCwpLm(double t) const {
+    const int lookIdx = getChoice("lookPreset", t, 0);
+    if (isUserLookPresetIndex(lookIdx)) {
+      int userIdx = -1;
+      if (!userLookIndexFromPresetIndex(lookIdx, &userIdx)) return 0.25f;
+      std::lock_guard<std::mutex> lock(userPresetMutex());
+      ensureUserPresetStoreLoadedLocked();
+      if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().lookPresets.size())) return 0.25f;
+      return userPresetStore().lookPresets[static_cast<size_t>(userIdx)].values.cwp_lm;
+    }
+    if (lookIdx < 0 || lookIdx >= static_cast<int>(kLookPresets.size())) return 0.25f;
+    return kLookPresets[static_cast<size_t>(lookIdx)].cwp_lm;
   }
 
   TonescalePresetValues selectedLookBaseTonescale(double t) const {
@@ -3423,19 +3474,36 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     return userPresetStore().tonescalePresets[static_cast<size_t>(userIdx)].name;
   }
 
-  void applyPresetMenuModifiedLabels(double t, bool lookModified, bool tonescaleModified) {
+  std::string creativeWhiteBaseMenuName(int idx) const {
+    switch (idx) {
+      case 0: return "USE LOOK PRESET";
+      case 1: return "D93";
+      case 2: return "D75";
+      case 3: return "D65";
+      case 4: return "D60";
+      case 5: return "D55";
+      case 6: return "D50";
+      default: return std::string();
+    }
+  }
+
+  void applyPresetMenuModifiedLabels(double t, bool lookModified, bool tonescaleModified, bool creativeWhiteModified) {
     const int lookIdx = getChoice("lookPreset", t, 0);
     const int toneIdx = getChoice("tonescalePreset", t, 0);
+    const int cwpIdx = getChoice("creativeWhitePreset", t, 0);
     if (menuLabelCacheInit_ &&
         lookIdx == menuLabelLookIdx_ &&
         toneIdx == menuLabelToneIdx_ &&
+        cwpIdx == menuLabelCwpIdx_ &&
         lookModified == menuLabelLookModified_ &&
-        tonescaleModified == menuLabelToneModified_) {
+        tonescaleModified == menuLabelToneModified_ &&
+        creativeWhiteModified == menuLabelCwpModified_) {
       // Fast path: avoid repeated setOption churn when nothing changed.
       return;
     }
     auto* lookParam = fetchChoiceParam("lookPreset");
     auto* toneParam = fetchChoiceParam("tonescalePreset");
+    auto* cwpParam = fetchChoiceParam("creativeWhitePreset");
 
     if (lookParam && menuLabelCacheInit_ && menuLabelLookIdx_ >= 0) {
       // Restore previous option text before applying new modified suffix.
@@ -3446,6 +3514,10 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
       const std::string basePrev = tonescaleBaseMenuName(menuLabelToneIdx_);
       if (!basePrev.empty()) toneParam->setOption(menuLabelToneIdx_, basePrev);
     }
+    if (cwpParam && menuLabelCacheInit_ && menuLabelCwpIdx_ >= 0) {
+      const std::string basePrev = creativeWhiteBaseMenuName(menuLabelCwpIdx_);
+      if (!basePrev.empty()) cwpParam->setOption(menuLabelCwpIdx_, basePrev);
+    }
 
     if (lookParam) {
       const std::string base = lookBaseMenuName(lookIdx);
@@ -3455,11 +3527,17 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
       const std::string base = tonescaleBaseMenuName(toneIdx);
       if (!base.empty() && tonescaleModified) toneParam->setOption(toneIdx, base + " (Modified)");
     }
+    if (cwpParam) {
+      const std::string base = creativeWhiteBaseMenuName(cwpIdx);
+      if (!base.empty() && creativeWhiteModified) cwpParam->setOption(cwpIdx, base + " (Modified)");
+    }
 
     menuLabelLookIdx_ = lookIdx;
     menuLabelToneIdx_ = toneIdx;
+    menuLabelCwpIdx_ = cwpIdx;
     menuLabelLookModified_ = lookModified;
     menuLabelToneModified_ = tonescaleModified;
+    menuLabelCwpModified_ = creativeWhiteModified;
     menuLabelCacheInit_ = true;
   }
 
@@ -3517,8 +3595,10 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     menuLabelCacheInit_ = false;
     menuLabelLookIdx_ = -1;
     menuLabelToneIdx_ = -1;
+    menuLabelCwpIdx_ = -1;
     menuLabelLookModified_ = false;
     menuLabelToneModified_ = false;
+    menuLabelCwpModified_ = false;
     rebuildLookPresetMenuOptions(preferredLookIndex);
     rebuildTonescalePresetMenuOptions(preferredToneIndex);
   }
@@ -3781,7 +3861,8 @@ std::string buildCubeViewerParamsJson(double time, bool deltaOnly, const std::st
     std::ostringstream os;
     os << "{";
     os << "\"type\":\"" << (deltaOnly ? "params_delta" : "params_snapshot") << "\",";
-    os << "\"seq\":" << cubeViewerSeq_++ << ",";
+    const uint64_t seq = cubeViewerSeq_.fetch_add(1u, std::memory_order_relaxed);
+    os << "\"seq\":" << seq << ",";
     os << "\"senderId\":\"" << cubeViewerSenderId() << "\",";
     os << "\"quality\":\"" << cubeViewerQualityName(cubeViewerQuality_) << "\",";
     os << "\"resolution\":" << cubeViewerQualityToResolution(cubeViewerQuality_) << ",";
@@ -3821,11 +3902,10 @@ std::string buildCubeViewerParamsJson(double time, bool deltaOnly, const std::st
 bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedParam, double time) {
     if (!cubeViewerRequested_) return false;
     if (!cubeViewerLive_ && !forceSnapshot) return false;
-    if (!cubeViewerWindowUsable_ && !forceSnapshot) return false;
     const auto now = std::chrono::steady_clock::now();
     if (!forceSnapshot) {
       const auto sinceLast = std::chrono::duration_cast<std::chrono::milliseconds>(now - cubeViewerLastSendAt_);
-      if (sinceLast.count() < 20 && changedParam == cubeViewerLastParam_) return false;
+      if (sinceLast.count() < 8) return false;
     }
     cubeViewerLastSendAt_ = now;
     cubeViewerLastParam_ = changedParam;
@@ -3836,12 +3916,11 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
   // Input-cloud gate: only emit when viewer is live/visible and source mode is input-image.
 bool shouldEmitCubeViewerInputCloud(double time) {
     if (!cubeViewerRequested_ || !cubeViewerLive_) return false;
-    if (!cubeViewerWindowUsable_) return false;
     if (getBool("cubeViewerIdentity", time, 1) != 0) return false;
     const auto now = std::chrono::steady_clock::now();
     if (cubeViewerLastCloudSendAt_ != std::chrono::steady_clock::time_point::min()) {
       const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - cubeViewerLastCloudSendAt_).count();
-      if (ms < 20) return false;
+      if (ms < 8) return false;
     }
     cubeViewerLastCloudSendAt_ = now;
     return true;
@@ -3858,22 +3937,14 @@ bool emitCubeViewerInputCloud(
     if (!srcBase || !dstBase || width <= 0 || height <= 0) return false;
     if (srcRowBytes == 0 || dstRowBytes == 0) return false;
 
-    const size_t pxCount = static_cast<size_t>(width) * static_cast<size_t>(height);
     size_t maxPts = 90000;
     if (cubeViewerQuality_ <= 0) maxPts = 45000;
     else if (cubeViewerQuality_ >= 2) maxPts = 180000;
+    const size_t pxCount = static_cast<size_t>(width) * static_cast<size_t>(height);
     const size_t targetPts = (maxPts < pxCount) ? maxPts : pxCount;
-    int yStep = 1;
-    if (targetPts < static_cast<size_t>(height) * 2u) {
-      yStep = static_cast<int>((static_cast<size_t>(height) + targetPts - 1u) / targetPts);
-      if (yStep < 1) yStep = 1;
-    }
-    size_t sampledRows = (static_cast<size_t>(height) + static_cast<size_t>(yStep) - 1u) / static_cast<size_t>(yStep);
-    if (sampledRows < 1u) sampledRows = 1u;
-    size_t targetPerRow = targetPts / sampledRows;
-    if (targetPerRow < 1u) targetPerRow = 1u;
-    int xStep = static_cast<int>((static_cast<size_t>(width) + targetPerRow - 1u) / targetPerRow);
-    if (xStep < 1) xStep = 1;
+    if (targetPts == 0u) return false;
+    const size_t srcStrideFloats = srcRowBytes / sizeof(float);
+    const size_t dstStrideFloats = dstRowBytes / sizeof(float);
 
     std::ostringstream pts;
     pts.setf(std::ios::fixed);
@@ -3882,39 +3953,42 @@ bool emitCubeViewerInputCloud(
     auto clamp01 = [](float v) -> float {
       return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
     };
-    for (int y = 0; y < height; y += yStep) {
-      const char* srcRow = reinterpret_cast<const char*>(srcBase) + static_cast<size_t>(y) * srcRowBytes;
-      const char* dstRow = reinterpret_cast<const char*>(dstBase) + static_cast<size_t>(y) * dstRowBytes;
-      const float* s = reinterpret_cast<const float*>(srcRow);
-      const float* d = reinterpret_cast<const float*>(dstRow);
-      const int xStart = (xStep > 1)
-                             ? static_cast<int>((static_cast<uint32_t>(y) * 1664525u + 1013904223u) %
-                                                static_cast<uint32_t>(xStep))
-                             : 0;
-      for (int x = xStart; x < width; x += xStep) {
-        const size_t i = static_cast<size_t>(x) * 4u;
-        const float sr = s[i + 0];
-        const float sg = s[i + 1];
-        const float sb = s[i + 2];
-        const float dr = d[i + 0];
-        const float dg = d[i + 1];
-        const float db = d[i + 2];
-        if (!std::isfinite(sr) || !std::isfinite(sg) || !std::isfinite(sb) ||
-            !std::isfinite(dr) || !std::isfinite(dg) || !std::isfinite(db)) {
-          continue;
-        }
-        if (!first) pts << ' ';
-        first = false;
-        // Plot coordinates are clamped to cube bounds to avoid out-of-range spikes.
-        pts << clamp01(sr) << ' ' << clamp01(sg) << ' ' << clamp01(sb) << ' '
-            << clamp01(dr) << ' ' << clamp01(dg) << ' ' << clamp01(db);
+    const size_t seqSeed = static_cast<size_t>(cubeViewerSeq_.load(std::memory_order_relaxed));
+    const size_t start = (pxCount > 1u) ? (seqSeed % pxCount) : 0u;
+    size_t step = (pxCount > targetPts) ? (pxCount / targetPts) : 1u;
+    if (step < 1u) step = 1u;
+    if ((step & 1u) == 0u) step += 1u;
+    while (std::gcd(step, pxCount) != 1u) step += 2u;
+
+    for (size_t n = 0; n < targetPts; ++n) {
+      const size_t linear = (start + n * step) % pxCount;
+      const int y = static_cast<int>(linear / static_cast<size_t>(width));
+      const int x = static_cast<int>(linear % static_cast<size_t>(width));
+
+      const size_t srcPix = static_cast<size_t>(y) * srcStrideFloats + static_cast<size_t>(x) * 4u;
+      const size_t dstPix = static_cast<size_t>(y) * dstStrideFloats + static_cast<size_t>(x) * 4u;
+      const float sr = srcBase[srcPix + 0];
+      const float sg = srcBase[srcPix + 1];
+      const float sb = srcBase[srcPix + 2];
+      const float dr = dstBase[dstPix + 0];
+      const float dg = dstBase[dstPix + 1];
+      const float db = dstBase[dstPix + 2];
+      if (!std::isfinite(sr) || !std::isfinite(sg) || !std::isfinite(sb) ||
+          !std::isfinite(dr) || !std::isfinite(dg) || !std::isfinite(db)) {
+        continue;
       }
+      if (!first) pts << ' ';
+      first = false;
+      // Plot coordinates are clamped to cube bounds to avoid out-of-range spikes.
+      pts << clamp01(sr) << ' ' << clamp01(sg) << ' ' << clamp01(sb) << ' '
+          << clamp01(dr) << ' ' << clamp01(dg) << ' ' << clamp01(db);
     }
 
     std::ostringstream os;
     os << "{";
     os << "\"type\":\"input_cloud\",";
-    os << "\"seq\":" << cubeViewerSeq_++ << ",";
+    const uint64_t seq = cubeViewerSeq_.fetch_add(1u, std::memory_order_relaxed);
+    os << "\"seq\":" << seq << ",";
     os << "\"senderId\":\"" << cubeViewerSenderId() << "\",";
     os << "\"quality\":\"" << cubeViewerQualityName(cubeViewerQuality_) << "\",";
     os << "\"resolution\":" << cubeViewerQualityToResolution(cubeViewerQuality_) << ",";
@@ -3949,11 +4023,13 @@ bool emitCubeViewerInputCloud(
 void pushCubeViewerUpdate(double time, const std::string& changedParam, bool forceSnapshot = false) {
     if (!shouldEmitCubeViewerUpdate(forceSnapshot, changedParam, time)) return;
     const std::string payload = buildCubeViewerParamsJson(time, !forceSnapshot, changedParam);
-    if (sendCubeViewerMessage(payload)) {
+    if (sendCubeViewerMessage(payload) || (connectCubeViewerWithRetry(2, 20) && sendCubeViewerMessage(payload))) {
       cubeViewerConnected_ = true;
+      cubeViewerWindowUsable_ = true;
       setCubeViewerStatusLabel(forceSnapshot ? "Connected" : "Updating");
     } else {
       cubeViewerConnected_ = false;
+      cubeViewerWindowUsable_ = false;
       setCubeViewerStatusLabel("Disconnected");
     }
   }
@@ -3996,7 +4072,7 @@ void openCubeViewerSession(double time) {
     if (!launchCubeViewerProcessAsync(&launchError, &launchedPath, &launchedPid)) {
       cubeViewerConnected_ = false;
       cubeViewerWindowUsable_ = false;
-      setCubeViewerStatusLabel("Launch failed: viewer executable not found");
+      setCubeViewerStatusLabel("Launch failed");
       if (debugLogEnabled()) {
         std::fprintf(stderr, "[ME_OpenDRT] Cube viewer launch failed: %s\n", launchError.c_str());
       }
@@ -4152,15 +4228,17 @@ void closeCubeViewerSession() {
   bool menuLabelCacheInit_ = false;
   int menuLabelLookIdx_ = -1;
   int menuLabelToneIdx_ = -1;
+  int menuLabelCwpIdx_ = -1;
   bool menuLabelLookModified_ = false;
   bool menuLabelToneModified_ = false;
+  bool menuLabelCwpModified_ = false;
   bool cubeViewerRequested_ = false;
   bool cubeViewerConnected_ = false;
   uint32_t cubeViewerProcessId_ = 0;
   bool cubeViewerLive_ = true;
   bool cubeViewerWindowUsable_ = false;
   int cubeViewerQuality_ = 1;
-  uint64_t cubeViewerSeq_ = 1;
+  std::atomic<uint64_t> cubeViewerSeq_{1};
   std::string cubeViewerStatusCache_ = "Disconnected";
   bool allowUiParamWrites_ = true;
   std::string cubeViewerLastParam_;
@@ -4180,7 +4258,7 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
   // ===== Plugin Descriptor =====
   // Host capability advertisement and static metadata.
   void describe(OFX::ImageEffectDescriptor& d) override {
-    static const std::string nameWithVersion = "ME_OpenDRT v1.1";
+    static const std::string nameWithVersion = "ME_OpenDRT v1.2.1";
     d.setLabels(nameWithVersion.c_str(), nameWithVersion.c_str(), nameWithVersion.c_str());
     d.setPluginGrouping(kPluginGrouping);
     d.setPluginDescription(std::string(kPluginDescription) + " | " + buildLabelText());
@@ -4568,7 +4646,7 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
 
     auto* supportOfxVersion = d.defineStringParam("supportOfxVersion");
     supportOfxVersion->setLabel("OFX version");
-    supportOfxVersion->setDefault("v1.2.0");
+    supportOfxVersion->setDefault("v1.2.1");
     supportOfxVersion->setEnabled(false);
     supportOfxVersion->setParent(*grpSupportRoot);
     pSupport->addChild(*supportOfxVersion);

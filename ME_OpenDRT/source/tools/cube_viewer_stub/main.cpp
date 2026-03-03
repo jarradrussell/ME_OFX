@@ -3,6 +3,7 @@
 #include <cmath>
 #include <csignal>
 #include <cstdint>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -49,6 +50,32 @@ std::string pipeName() {
   return "\\\\.\\pipe\\ME_OpenDRT_CubeViewer";
 #else
   return "/tmp/me_opendrt_cube_viewer.sock";
+#endif
+}
+
+std::string viewerLogPath() {
+#if defined(_WIN32)
+  return std::string();
+#elif defined(__APPLE__)
+  const char* home = std::getenv("HOME");
+  if (!home || home[0] == '\0') return "/tmp/ME_OpenDRT_CubeViewer.log";
+  return std::string(home) + "/Library/Logs/ME_OpenDRT_CubeViewer.log";
+#else
+  const char* home = std::getenv("HOME");
+  if (!home || home[0] == '\0') return "/tmp/ME_OpenDRT_CubeViewer.log";
+  return std::string(home) + "/.cache/ME_OpenDRT_CubeViewer.log";
+#endif
+}
+
+void logViewerEvent(const std::string& msg) {
+#if !defined(_WIN32)
+  const std::string path = viewerLogPath();
+  FILE* f = std::fopen(path.c_str(), "a");
+  if (!f) return;
+  std::fprintf(f, "[ME_OpenDRT_CubeViewer] %s\n", msg.c_str());
+  std::fclose(f);
+#else
+  (void)msg;
 #endif
 }
 
@@ -600,16 +627,22 @@ void ipcServerLoop() {
   const std::string path = pipeName();
   ::unlink(path.c_str());
   int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
-  if (fd < 0) return;
+  if (fd < 0) {
+    logViewerEvent(std::string("IPC socket() failed: errno=") + std::to_string(errno) + " (" + std::strerror(errno) + ")");
+    return;
+  }
 
   sockaddr_un addr{};
   addr.sun_family = AF_UNIX;
   std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
   if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    logViewerEvent(
+        std::string("IPC bind() failed for ") + path + ": errno=" + std::to_string(errno) + " (" + std::strerror(errno) + ")");
     ::close(fd);
     return;
   }
   if (::listen(fd, 4) != 0) {
+    logViewerEvent(std::string("IPC listen() failed: errno=") + std::to_string(errno) + " (" + std::strerror(errno) + ")");
     ::close(fd);
     ::unlink(path.c_str());
     return;
@@ -763,6 +796,7 @@ int runApp() {
 #endif
 
   if (!glfwInit()) {
+    logViewerEvent("glfwInit() failed");
 #if defined(_WIN32)
     if (singleInstanceMutex != nullptr) CloseHandle(singleInstanceMutex);
 #endif
@@ -776,12 +810,14 @@ int runApp() {
 
   GLFWwindow* window = glfwCreateWindow(864, 560, "ME_OpenDRT Cube Viewer", nullptr, nullptr);
   if (!window) {
+    logViewerEvent("glfwCreateWindow() failed");
     glfwTerminate();
 #if defined(_WIN32)
     if (singleInstanceMutex != nullptr) CloseHandle(singleInstanceMutex);
 #endif
     return 1;
   }
+  logViewerEvent("Viewer startup ok");
 
   glfwMakeContextCurrent(window);
   glfwSwapInterval(1);
@@ -820,7 +856,8 @@ int runApp() {
   mesh.quality = "Medium";
   mesh.renderOk = true;
   mesh.maxDelta = 0.0f;
-  uint64_t lastAppliedSeq = 0;
+  uint64_t lastParamsSeq = 0;
+  uint64_t lastCloudSeq = 0;
 
   while (gRun.load() && !glfwWindowShouldClose(window)) {
     glfwPollEvents();
@@ -848,12 +885,13 @@ int runApp() {
       if (parseParamsMessage(pendingParams.line, &rp)) {
         if (!rp.senderId.empty() && rp.senderId != app.currentSenderId) {
           app.currentSenderId = rp.senderId;
-          lastAppliedSeq = 0;
+          lastParamsSeq = 0;
+          lastCloudSeq = 0;
         }
-        if (rp.seq < lastAppliedSeq) {
-          // Ignore stale param snapshots/deltas that arrive after newer cloud frames.
+        if (rp.seq < lastParamsSeq) {
+          // Ignore stale param snapshots/deltas within the params stream.
         } else {
-          lastAppliedSeq = rp.seq;
+          lastParamsSeq = rp.seq;
           const std::string prevSourceMode = app.currentSourceMode;
           app.keepOnTop = (rp.alwaysOnTop != 0);
           app.currentSourceMode = rp.sourceMode;
@@ -883,11 +921,11 @@ int runApp() {
       if (parseInputCloudMessage(pendingCloud.line, &cp)) {
         if (!app.currentSenderId.empty() && !cp.senderId.empty() && cp.senderId != app.currentSenderId) {
           // Ignore clouds from a different OFX instance than the active sender.
-        } else if (cp.seq >= lastAppliedSeq && app.currentSourceMode == "input") {
+        } else if (cp.seq >= lastCloudSeq && app.currentSourceMode == "input") {
           MeshData nextMesh{};
           if (buildInputCloudMesh(cp, &nextMesh)) {
             mesh = std::move(nextMesh);
-            lastAppliedSeq = cp.seq;
+            lastCloudSeq = cp.seq;
           }
         }
       }

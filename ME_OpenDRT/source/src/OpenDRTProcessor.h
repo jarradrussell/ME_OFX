@@ -392,10 +392,22 @@ class OpenDRTProcessor {
       int height,
       size_t srcRowBytes,
       size_t dstRowBytes,
+      int originX,
+      int originY,
       void* metalCommandQueue) {
     const auto t0 = std::chrono::steady_clock::now();
     const bool ok = OpenDRTMetal::renderHost(
-        srcMetalBuffer, dstMetalBuffer, width, height, srcRowBytes, dstRowBytes, params_, derived_, metalCommandQueue);
+        srcMetalBuffer,
+        dstMetalBuffer,
+        width,
+        height,
+        srcRowBytes,
+        dstRowBytes,
+        originX,
+        originY,
+        params_,
+        derived_,
+        metalCommandQueue);
     perfLogStage("Metal host render", t0);
     return ok;
   }

@@ -23,6 +23,8 @@ bool renderHost(
     int height,
     size_t srcRowBytes,
     size_t dstRowBytes,
+    int originX,
+    int originY,
     const OpenDRTParams& params,
     const OpenDRTDerivedParams& derived,
     void* metalCommandQueue);
