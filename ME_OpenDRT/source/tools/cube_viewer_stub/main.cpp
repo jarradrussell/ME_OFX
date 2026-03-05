@@ -1135,7 +1135,7 @@ int runApp() {
     if (pointCount < 8000u) densityFactor = 1.10f;
     else if (pointCount > 50000u) densityFactor = 0.92f;
     // QUICK_TWEAK_POINT_SIZE: adjust this multiplier to make cube sample points smaller/larger.
-    const float kPointSizeUserScale = 1.16f;
+    const float kPointSizeUserScale = 1.28f;
     float pointSize = basePointSize * distanceFactor * densityFactor * kPointSizeUserScale;
     if (pointSize < 1.2f) pointSize = 1.2f;
     if (pointSize > 5.0f) pointSize = 5.0f;
