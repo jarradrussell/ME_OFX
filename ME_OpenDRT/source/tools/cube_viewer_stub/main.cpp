@@ -82,6 +82,23 @@ void logViewerEvent(const std::string& msg) {
 #endif
 }
 
+#if !defined(_WIN32)
+bool sendAllSocket(int fd, const char* data, size_t size) {
+  if (fd < 0 || data == nullptr) return false;
+  size_t totalSent = 0;
+  while (totalSent < size) {
+    const ssize_t sent = ::send(fd, data + totalSent, size - totalSent, 0);
+    if (sent <= 0) {
+      logViewerEvent(std::string("socket send failed after ") + std::to_string(totalSent) + "/" +
+                     std::to_string(size) + " bytes: errno=" + std::to_string(errno) + " (" + std::strerror(errno) + ")");
+      return false;
+    }
+    totalSent += static_cast<size_t>(sent);
+  }
+  return true;
+}
+#endif
+
 struct CameraState {
   float qx = 0.0f;
   float qy = 0.0f;
@@ -819,10 +836,13 @@ void ipcServerLoop() {
         if (!response.empty()) {
           std::string payload = response;
           payload.push_back('\n');
-          (void)::send(client, payload.data(), payload.size(), 0);
+          (void)sendAllSocket(client, payload.data(), payload.size());
         }
         pending.erase(0, nl + 1);
       }
+    }
+    if (!pending.empty()) {
+      logViewerEvent(std::string("Connection closed with unterminated payload bytes=") + std::to_string(pending.size()));
     }
     ::close(client);
   }
@@ -840,7 +860,7 @@ void wakeIpcServer() {
   std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
   if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
     const char nl = '\n';
-    (void)::send(fd, &nl, 1, 0);
+    (void)sendAllSocket(fd, &nl, 1);
   }
   ::close(fd);
 }

@@ -172,6 +172,12 @@ void appendMacDebugLogLine(const std::string& line) {
 #endif
 }
 
+void cubeViewerDebugLog(const std::string& line) {
+  if (!debugLogEnabled()) return;
+  std::fprintf(stderr, "[ME_OpenDRT][CubeViewer] %s\n", line.c_str());
+  appendMacDebugLogLine(std::string("[ME_OpenDRT][CubeViewer] ") + line);
+}
+
 // Perf logging writes to stderr and platform-local file locations to help compare host/internal paths.
 // Logging is opt-in and non-fatal: any filesystem failures are ignored.
 void perfLog(const char* stage, const std::chrono::steady_clock::time_point& start) {
@@ -450,9 +456,23 @@ bool sendCubeViewerMessage(const std::string& msg) {
 #ifdef MSG_NOSIGNAL
   sendFlags |= MSG_NOSIGNAL;
 #endif
-  const ssize_t sent = ::send(fd, payload.data(), payload.size(), sendFlags);
+  size_t totalSent = 0;
+  while (totalSent < payload.size()) {
+    const ssize_t sent = ::send(fd, payload.data() + totalSent, payload.size() - totalSent, sendFlags);
+    if (sent <= 0) {
+      if (debugLogEnabled()) {
+        std::ostringstream os;
+        os << "sendCubeViewerMessage failed after " << totalSent << "/" << payload.size()
+           << " bytes, errno=" << errno << " (" << std::strerror(errno) << ")";
+        cubeViewerDebugLog(os.str());
+      }
+      ::close(fd);
+      return false;
+    }
+    totalSent += static_cast<size_t>(sent);
+  }
   ::close(fd);
-  return sent == static_cast<ssize_t>(payload.size());
+  return true;
 #endif
 }
 
@@ -536,10 +556,14 @@ bool sendCubeViewerHeartbeatProbe(
     ::close(fd);
     return false;
   }
-  const ssize_t sent = ::send(fd, payload.data(), payload.size(), 0);
-  if (sent != static_cast<ssize_t>(payload.size())) {
-    ::close(fd);
-    return false;
+  size_t totalSent = 0;
+  while (totalSent < payload.size()) {
+    const ssize_t sent = ::send(fd, payload.data() + totalSent, payload.size() - totalSent, 0);
+    if (sent <= 0) {
+      ::close(fd);
+      return false;
+    }
+    totalSent += static_cast<size_t>(sent);
   }
   timeval tv{};
   if (timeoutMs < 1) timeoutMs = 1;
@@ -4298,11 +4322,25 @@ bool shouldEmitCubeViewerInputCloud(double time) {
     os << "\"points\":\"" << jsonEscape(pts.str()) << "\"";
     os << "}";
 
+    if (debugLogEnabled()) {
+      std::ostringstream diag;
+      diag << "Emitting input cloud payload bytes=" << os.str().size()
+           << " points=" << targetPts
+           << " image=" << width << "x" << height
+           << " quality=" << cubeViewerQualityName(cubeViewerQuality_);
+      cubeViewerDebugLog(diag.str());
+    }
+
     if (sendCubeViewerMessage(os.str()) || (connectCubeViewerWithRetry(1, 10) && sendCubeViewerMessage(os.str()))) {
       cubeViewerConnected_ = true;
       cubeViewerWindowUsable_ = true;
       setCubeViewerStatusLabel("Updating");
       return true;
+    }
+    if (debugLogEnabled()) {
+      std::ostringstream diag;
+      diag << "Input cloud send failed, payload bytes=" << os.str().size();
+      cubeViewerDebugLog(diag.str());
     }
     cubeViewerConnected_ = false;
     cubeViewerWindowUsable_ = false;
