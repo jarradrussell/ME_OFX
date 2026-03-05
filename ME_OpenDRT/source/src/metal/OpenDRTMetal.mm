@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <sstream>
 #include <mutex>
 #include <string>
 #include <atomic>
@@ -87,6 +88,11 @@ bool disableMetal2DCopy() {
   return enabled;
 }
 
+bool metalDiagEnabled() {
+  static const bool enabled = envFlagEnabled("ME_OPENDRT_METAL_DIAG");
+  return enabled;
+}
+
 enum class HostOffsetMode {
   Auto,
   Zero,
@@ -154,6 +160,45 @@ void debugLog(const char* msg) {
       std::fprintf(f, "[ME_OpenDRT][Metal] %s\n", msg);
       std::fclose(f);
     }
+  }
+}
+
+void diagLog(const std::string& msg) {
+  if (!metalDiagEnabled()) return;
+  std::fprintf(stderr, "[ME_OpenDRT][MetalDiag] %s\n", msg.c_str());
+  static std::mutex logMutex;
+  static bool pathInit = false;
+  static std::string logPath;
+  if (!pathInit) {
+    pathInit = true;
+    const char* home = std::getenv("HOME");
+    if (home != nullptr && home[0] != '\0') {
+      const std::string logsDir = std::string(home) + "/Library/Logs";
+      (void)::mkdir(logsDir.c_str(), 0755);
+      logPath = logsDir + "/ME_OpenDRT.log";
+    }
+  }
+  if (!logPath.empty()) {
+    std::lock_guard<std::mutex> lock(logMutex);
+    FILE* f = std::fopen(logPath.c_str(), "a");
+    if (f != nullptr) {
+      std::fprintf(f, "[ME_OpenDRT][MetalDiag] %s\n", msg.c_str());
+      std::fclose(f);
+    }
+  }
+}
+
+const char* hostOffsetModeName(HostOffsetMode mode) {
+  switch (mode) {
+    case HostOffsetMode::Zero:
+      return "ZERO";
+    case HostOffsetMode::Origin:
+      return "ORIGIN";
+    case HostOffsetMode::FallbackAmbiguous:
+      return "FALLBACK";
+    case HostOffsetMode::Auto:
+    default:
+      return "AUTO";
   }
 }
 
@@ -502,6 +547,27 @@ bool renderHost(
 
   const bool ambiguousOffset = hasOriginOffset && canUseZero && canUseOffset;
   const HostOffsetMode offsetMode = hostOffsetMode();
+  {
+    static std::atomic<unsigned long long> seq{0};
+    const unsigned long long n = ++seq;
+    if (metalDiagEnabled() && (n <= 32ull || (n % 120ull) == 0ull || ambiguousOffset)) {
+      std::ostringstream oss;
+      oss << "host-call#" << n
+          << " size=" << width << "x" << height
+          << " rowBytes=" << srcRowBytes << "/" << dstRowBytes
+          << " origin=(" << originX << "," << originY << ")"
+          << " mode=" << hostOffsetModeName(offsetMode)
+          << " hasOrigin=" << (hasOriginOffset ? 1 : 0)
+          << " canZero=" << (canUseZero ? 1 : 0)
+          << " canOffset=" << (canUseOffset ? 1 : 0)
+          << " ambiguous=" << (ambiguousOffset ? 1 : 0)
+          << " srcLen=" << static_cast<size_t>(srcBuffer.length)
+          << " dstLen=" << static_cast<size_t>(dstBuffer.length)
+          << " forceWait=" << (forceHostMetalWait() ? 1 : 0)
+          << " intermDst=" << (useHostIntermediateDst() ? 1 : 0);
+      diagLog(oss.str());
+    }
+  }
   switch (offsetMode) {
     case HostOffsetMode::Zero:
       if (!canUseZero) return false;
@@ -549,6 +615,13 @@ bool renderHost(
             originY);
       }
       break;
+  }
+
+  if (metalDiagEnabled()) {
+    std::ostringstream oss;
+    oss << "offset-select srcOff=" << srcOffsetBytes << " dstOff=" << dstOffsetBytes
+        << " required=" << requiredSrcBytes << "/" << requiredDstBytes;
+    diagLog(oss.str());
   }
 
   if (srcBuffer.length < srcOffsetBytes + requiredSrcBytes || dstBuffer.length < dstOffsetBytes + requiredDstBytes) {
@@ -630,8 +703,17 @@ bool renderHost(
             NSLog(@"ME_OpenDRT Metal host async failure with unknown error");
           }
         }
+        if (metalDiagEnabled()) {
+          std::ostringstream oss;
+          oss << "async-complete status=" << static_cast<int>(cb.status)
+              << " errors=" << context().hostAsyncErrorCount.load(std::memory_order_relaxed);
+          diagLog(oss.str());
+        }
       } else {
         context().hostAsyncErrorCount.store(0, std::memory_order_relaxed);
+        if (metalDiagEnabled()) {
+          diagLog("async-complete status=COMPLETED errors=0");
+        }
       }
     }];
   }
@@ -647,6 +729,9 @@ bool renderHost(
       return false;
     }
     ctx.hostAsyncErrorCount.store(0, std::memory_order_relaxed);
+    if (metalDiagEnabled()) {
+      diagLog("sync-complete status=COMPLETED errors=0");
+    }
   }
 
   if (!forceHostMetalWait()) {
