@@ -31,7 +31,7 @@
 #include <unistd.h>
 extern char** environ;
 #endif
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 #include <cerrno>
 #include <sys/stat.h>
 #endif
@@ -145,6 +145,33 @@ bool debugLogEnabled() {
   return enabled;
 }
 
+void appendMacDebugLogLine(const std::string& line) {
+#if defined(__APPLE__)
+  static std::mutex logMutex;
+  static bool pathInit = false;
+  static std::string logPath;
+  if (!pathInit) {
+    pathInit = true;
+    const char* home = std::getenv("HOME");
+    if (home && home[0] != '\0') {
+      const std::string logsDir = std::string(home) + "/Library/Logs";
+      (void)::mkdir(logsDir.c_str(), 0755);
+      logPath = logsDir + "/ME_OpenDRT.log";
+    }
+  }
+  if (!logPath.empty()) {
+    std::lock_guard<std::mutex> lock(logMutex);
+    FILE* f = std::fopen(logPath.c_str(), "a");
+    if (f != nullptr) {
+      std::fprintf(f, "%s\n", line.c_str());
+      std::fclose(f);
+    }
+  }
+#else
+  (void)line;
+#endif
+}
+
 // Perf logging writes to stderr and platform-local file locations to help compare host/internal paths.
 // Logging is opt-in and non-fatal: any filesystem failures are ignored.
 void perfLog(const char* stage, const std::chrono::steady_clock::time_point& start) {
@@ -152,6 +179,11 @@ void perfLog(const char* stage, const std::chrono::steady_clock::time_point& sta
   const auto now = std::chrono::steady_clock::now();
   const double ms = std::chrono::duration<double, std::milli>(now - start).count();
   std::fprintf(stderr, "[ME_OpenDRT][PERF] %s: %.3f ms\n", stage, ms);
+  {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf), "[ME_OpenDRT][PERF] %s: %.3f ms", stage, ms);
+    appendMacDebugLogLine(buf);
+  }
 #if defined(_WIN32)
   static bool pathInit = false;
   static std::filesystem::path logPath;

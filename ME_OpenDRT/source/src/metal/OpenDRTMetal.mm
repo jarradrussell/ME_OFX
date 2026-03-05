@@ -12,6 +12,7 @@
 #include <mutex>
 #include <string>
 #include <atomic>
+#include <sys/stat.h>
 
 #include "OpenDRTMetal.h"
 
@@ -103,7 +104,13 @@ HostOffsetMode hostOffsetMode() {
       if (s == "ORIGIN") return HostOffsetMode::Origin;
       if (s == "FALLBACK" || s == "SAFE") return HostOffsetMode::FallbackAmbiguous;
     }
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+    // Apple Silicon safety default:
+    // if host offset interpretation is ambiguous, do not guess; fall back out of host-metal path.
+    return HostOffsetMode::FallbackAmbiguous;
+#else
     return HostOffsetMode::Auto;
+#endif
   }();
   return mode;
 }
@@ -128,6 +135,26 @@ bool useHostIntermediateDst() {
 void debugLog(const char* msg) {
   if (!debugLogEnabled()) return;
   std::fprintf(stderr, "[ME_OpenDRT][Metal] %s\n", msg);
+  static std::mutex logMutex;
+  static bool pathInit = false;
+  static std::string logPath;
+  if (!pathInit) {
+    pathInit = true;
+    const char* home = std::getenv("HOME");
+    if (home != nullptr && home[0] != '\0') {
+      const std::string logsDir = std::string(home) + "/Library/Logs";
+      (void)::mkdir(logsDir.c_str(), 0755);
+      logPath = logsDir + "/ME_OpenDRT.log";
+    }
+  }
+  if (!logPath.empty()) {
+    std::lock_guard<std::mutex> lock(logMutex);
+    FILE* f = std::fopen(logPath.c_str(), "a");
+    if (f != nullptr) {
+      std::fprintf(f, "[ME_OpenDRT][Metal] %s\n", msg);
+      std::fclose(f);
+    }
+  }
 }
 
 void perfLogStage(const char* stage, const std::chrono::steady_clock::time_point& start) {
@@ -135,6 +162,26 @@ void perfLogStage(const char* stage, const std::chrono::steady_clock::time_point
   const auto now = std::chrono::steady_clock::now();
   const double ms = std::chrono::duration<double, std::milli>(now - start).count();
   std::fprintf(stderr, "[ME_OpenDRT][PERF][Metal] %s: %.3f ms\n", stage, ms);
+  static std::mutex logMutex;
+  static bool pathInit = false;
+  static std::string logPath;
+  if (!pathInit) {
+    pathInit = true;
+    const char* home = std::getenv("HOME");
+    if (home != nullptr && home[0] != '\0') {
+      const std::string logsDir = std::string(home) + "/Library/Logs";
+      (void)::mkdir(logsDir.c_str(), 0755);
+      logPath = logsDir + "/ME_OpenDRT.log";
+    }
+  }
+  if (!logPath.empty()) {
+    std::lock_guard<std::mutex> lock(logMutex);
+    FILE* f = std::fopen(logPath.c_str(), "a");
+    if (f != nullptr) {
+      std::fprintf(f, "[ME_OpenDRT][PERF][Metal] %s: %.3f ms\n", stage, ms);
+      std::fclose(f);
+    }
+  }
 }
 
 std::string moduleDirectory() {

@@ -11,6 +11,9 @@
 #include <string>
 #include <sstream>
 #include <vector>
+#if defined(__APPLE__)
+#include <sys/stat.h>
+#endif
 
 #include "OpenDRTParams.h"
 #include "OpenDRTCPUCore.h"
@@ -543,6 +546,7 @@ class OpenDRTProcessor {
   void debugLog(const char* msg) const {
     if (!debugLogEnabled_) return;
     std::fprintf(stderr, "[ME_OpenDRT] %s\n", msg);
+    appendMacLogLine(std::string("[ME_OpenDRT] ") + msg);
   }
 
   void perfLogStage(const char* label, const std::chrono::steady_clock::time_point& start) const {
@@ -550,6 +554,11 @@ class OpenDRTProcessor {
     const auto now = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration<double, std::milli>(now - start).count();
     std::fprintf(stderr, "[ME_OpenDRT][PERF] %s: %.3f ms\n", label, ms);
+    {
+      char buf[256];
+      std::snprintf(buf, sizeof(buf), "[ME_OpenDRT][PERF] %s: %.3f ms", label, ms);
+      appendMacLogLine(buf);
+    }
 #if defined(_WIN32)
     static bool pathInit = false;
     static std::string logPath;
@@ -569,6 +578,33 @@ class OpenDRTProcessor {
         ofs << "[ME_OpenDRT][PERF] " << label << ": " << ms << " ms\n";
       }
     }
+#endif
+  }
+
+  void appendMacLogLine(const std::string& line) const {
+#if defined(__APPLE__)
+    static std::mutex logMutex;
+    static bool pathInit = false;
+    static std::string logPath;
+    if (!pathInit) {
+      pathInit = true;
+      const char* home = std::getenv("HOME");
+      if (home != nullptr && home[0] != '\0') {
+        const std::string logsDir = std::string(home) + "/Library/Logs";
+        (void)::mkdir(logsDir.c_str(), 0755);
+        logPath = logsDir + "/ME_OpenDRT.log";
+      }
+    }
+    if (!logPath.empty()) {
+      std::lock_guard<std::mutex> lock(logMutex);
+      FILE* f = std::fopen(logPath.c_str(), "a");
+      if (f != nullptr) {
+        std::fprintf(f, "%s\n", line.c_str());
+        std::fclose(f);
+      }
+    }
+#else
+    (void)line;
 #endif
   }
 
