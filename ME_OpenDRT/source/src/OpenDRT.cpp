@@ -76,6 +76,15 @@ bool forceStageCopyEnabled() {
   return enabled;
 }
 
+bool cubeViewerDisableHighQualityGateEnabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("ME_OPENDRT_CUBE_VIEWER_DISABLE_HQ_GATE");
+    if (v == nullptr || v[0] == '\0') return false;
+    return !(v[0] == '0' && v[1] == '\0');
+  }();
+  return enabled;
+}
+
 enum class CudaRenderMode {
   HostPreferred,
   InternalOnly
@@ -176,6 +185,14 @@ void cubeViewerDebugLog(const std::string& line) {
   if (!debugLogEnabled()) return;
   std::fprintf(stderr, "[ME_OpenDRT][CubeViewer] %s\n", line.c_str());
   appendMacDebugLogLine(std::string("[ME_OpenDRT][CubeViewer] ") + line);
+}
+
+void cubeViewerDebugLogGate(const std::string& line) {
+  static std::atomic<unsigned long long> counter{0};
+  const unsigned long long n = ++counter;
+  if (n <= 24ull || (n % 120ull) == 0ull) {
+    cubeViewerDebugLog(line);
+  }
 }
 
 // Perf logging writes to stderr and platform-local file locations to help compare host/internal paths.
@@ -2201,8 +2218,20 @@ void render(const OFX::RenderArguments& args) override {
     OpenDRTParams params = resolveParams(raw);
     perfLog("Param resolve", tResolveStart);
     const bool wantInputCloud = cubeViewerRequested_ && cubeViewerLive_ && (getBool("cubeViewerIdentity", args.time, 1) == 0);
-    const bool wantHighQualityInputCloud =
-        wantInputCloud && isFullFrameRenderWindow(bounds, args.renderWindow) && isHighQualityRenderForCloud(args);
+    const bool fullFrameForCloud = isFullFrameRenderWindow(bounds, args.renderWindow);
+    const bool highQualityForCloud = isHighQualityRenderForCloud(args);
+    const bool wantHighQualityInputCloud = wantInputCloud && fullFrameForCloud && highQualityForCloud;
+    const bool bypassCloudQualityGate = wantInputCloud && cubeViewerDisableHighQualityGateEnabled();
+    if (wantInputCloud && !wantHighQualityInputCloud && debugLogEnabled()) {
+      std::ostringstream os;
+      os << "Input cloud gated: fullFrame=" << (fullFrameForCloud ? 1 : 0)
+         << " renderScale=" << args.renderScale.x << "x" << args.renderScale.y
+         << " draft=" << (args.renderQualityDraft ? 1 : 0)
+         << " bypass=" << (bypassCloudQualityGate ? 1 : 0)
+         << " renderWindow=(" << args.renderWindow.x1 << "," << args.renderWindow.y1 << ")-("
+         << args.renderWindow.x2 << "," << args.renderWindow.y2 << ")";
+      cubeViewerDebugLogGate(os.str());
+    }
 
     if (!processor_) {
       processor_ = std::make_unique<OpenDRTProcessor>(params);
@@ -2230,7 +2259,7 @@ void render(const OFX::RenderArguments& args) override {
       const size_t dstRowBytes = dstRb < 0 ? static_cast<size_t>(-dstRb) : static_cast<size_t>(dstRb);
       if (srcDevice != nullptr && dstDevice != nullptr &&
           processor_->renderCUDAHostBuffers(srcDevice, dstDevice, width, height, srcRowBytes, dstRowBytes, args.pCudaStream)) {
-        if (wantHighQualityInputCloud && shouldEmitCubeViewerInputCloud(args.time)) {
+        if ((wantHighQualityInputCloud || bypassCloudQualityGate) && shouldEmitCubeViewerInputCloud(args.time)) {
           const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
           if (ensureStageBuffers(pixelCount)) {
             float* srcStage = stageSrcPtr();
@@ -2295,7 +2324,7 @@ void render(const OFX::RenderArguments& args) override {
     // Host-Metal returns before the generic host-readable cloud publish step below.
     // When the viewer is in input-cloud mode, fall through to the existing staged/direct paths instead.
     const bool tryHostMetal =
-        preferHostMetal && args.isEnabledMetalRender && (args.pMetalCmdQ != nullptr) && !wantHighQualityInputCloud;
+        preferHostMetal && args.isEnabledMetalRender && (args.pMetalCmdQ != nullptr) && !wantHighQualityInputCloud && !bypassCloudQualityGate;
     if (tryHostMetal) {
       const auto tHostMetal = std::chrono::steady_clock::now();
       const void* srcMetalBuffer = src->getPixelData();
@@ -2403,7 +2432,7 @@ void render(const OFX::RenderArguments& args) override {
       renderedDstPitch = rowBytes;
     }
 
-    if (rendered && wantHighQualityInputCloud) {
+    if (rendered && (wantHighQualityInputCloud || bypassCloudQualityGate)) {
       (void)pushCubeViewerInputCloud(
           args.time, renderedSrcBase, renderedSrcPitch, renderedDstBase, renderedDstPitch, width, height);
     }
@@ -4198,15 +4227,31 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
   }
 
   // Input-cloud gate: only emit when viewer is live/visible and source mode is input-image.
-bool shouldEmitCubeViewerInputCloud(double time) {
-    if (!cubeViewerRequested_ || !cubeViewerLive_) return false;
+  bool shouldEmitCubeViewerInputCloud(double time) {
+    if (!cubeViewerRequested_ || !cubeViewerLive_) {
+      if (debugLogEnabled()) cubeViewerDebugLogGate("Input cloud blocked: viewer not requested/live.");
+      return false;
+    }
     // Allow emit path to self-heal stale connection state by attempting reconnect.
-    if (!cubeViewerRuntimeActiveForStreaming()) return false;
-    if (getBool("cubeViewerIdentity", time, 1) != 0) return false;
+    if (!cubeViewerRuntimeActiveForStreaming()) {
+      if (debugLogEnabled()) cubeViewerDebugLogGate("Input cloud blocked: runtime not active for streaming.");
+      return false;
+    }
+    if (getBool("cubeViewerIdentity", time, 1) != 0) {
+      if (debugLogEnabled()) cubeViewerDebugLogGate("Input cloud blocked: identity mode is enabled.");
+      return false;
+    }
     const auto now = std::chrono::steady_clock::now();
     if (cubeViewerLastCloudSendAt_ != std::chrono::steady_clock::time_point::min()) {
       const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - cubeViewerLastCloudSendAt_).count();
-      if (ms < 8) return false;
+      if (ms < 8) {
+        if (debugLogEnabled()) {
+          std::ostringstream os;
+          os << "Input cloud throttled: sinceLastMs=" << ms;
+          cubeViewerDebugLogGate(os.str());
+        }
+        return false;
+      }
     }
     cubeViewerLastCloudSendAt_ = now;
     return true;
