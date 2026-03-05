@@ -2177,6 +2177,8 @@ void render(const OFX::RenderArguments& args) override {
     OpenDRTParams params = resolveParams(raw);
     perfLog("Param resolve", tResolveStart);
     const bool wantInputCloud = cubeViewerRequested_ && cubeViewerLive_ && (getBool("cubeViewerIdentity", args.time, 1) == 0);
+    const bool wantHighQualityInputCloud =
+        wantInputCloud && isFullFrameRenderWindow(bounds, args.renderWindow) && isHighQualityRenderForCloud(args);
 
     if (!processor_) {
       processor_ = std::make_unique<OpenDRTProcessor>(params);
@@ -2204,8 +2206,7 @@ void render(const OFX::RenderArguments& args) override {
       const size_t dstRowBytes = dstRb < 0 ? static_cast<size_t>(-dstRb) : static_cast<size_t>(dstRb);
       if (srcDevice != nullptr && dstDevice != nullptr &&
           processor_->renderCUDAHostBuffers(srcDevice, dstDevice, width, height, srcRowBytes, dstRowBytes, args.pCudaStream)) {
-        if (wantInputCloud && isFullFrameRenderWindow(bounds, args.renderWindow) && isHighQualityRenderForCloud(args) &&
-            shouldEmitCubeViewerInputCloud(args.time)) {
+        if (wantHighQualityInputCloud && shouldEmitCubeViewerInputCloud(args.time)) {
           const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
           if (ensureStageBuffers(pixelCount)) {
             float* srcStage = stageSrcPtr();
@@ -2267,7 +2268,10 @@ void render(const OFX::RenderArguments& args) override {
     // - Uses host-provided command queue + MTLBuffer image handles.
     // - Avoids plugin-owned CPU staging copies.
     const bool preferHostMetal = (selectedMetalRenderMode() == MetalRenderMode::HostPreferred);
-    const bool tryHostMetal = preferHostMetal && args.isEnabledMetalRender && (args.pMetalCmdQ != nullptr);
+    // Host-Metal returns before the generic host-readable cloud publish step below.
+    // When the viewer is in input-cloud mode, fall through to the existing staged/direct paths instead.
+    const bool tryHostMetal =
+        preferHostMetal && args.isEnabledMetalRender && (args.pMetalCmdQ != nullptr) && !wantHighQualityInputCloud;
     if (tryHostMetal) {
       const auto tHostMetal = std::chrono::steady_clock::now();
       const void* srcMetalBuffer = src->getPixelData();
@@ -2375,7 +2379,7 @@ void render(const OFX::RenderArguments& args) override {
       renderedDstPitch = rowBytes;
     }
 
-    if (rendered && isFullFrameRenderWindow(bounds, args.renderWindow) && isHighQualityRenderForCloud(args)) {
+    if (rendered && wantHighQualityInputCloud) {
       (void)pushCubeViewerInputCloud(
           args.time, renderedSrcBase, renderedSrcPitch, renderedDstBase, renderedDstPitch, width, height);
     }

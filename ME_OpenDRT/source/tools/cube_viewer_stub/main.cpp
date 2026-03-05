@@ -225,6 +225,10 @@ struct PendingMessage {
   std::string line;
 };
 
+bool senderMatchesCurrent(const std::string& currentSenderId, const std::string& senderId) {
+  return currentSenderId.empty() || senderId.empty() || senderId == currentSenderId;
+}
+
 std::mutex gMsgMutex;
 PendingMessage gPendingParamsMsg;
 PendingMessage gPendingCloudMsg;
@@ -1020,6 +1024,8 @@ int runApp() {
   mesh.maxDelta = 0.0f;
   uint64_t lastParamsSeq = 0;
   uint64_t lastCloudSeq = 0;
+  InputCloudPayload deferredCloud{};
+  bool hasDeferredCloud = false;
 
   while (gRun.load() && !glfwWindowShouldClose(window)) {
     glfwPollEvents();
@@ -1047,12 +1053,13 @@ int runApp() {
     }
     if (haveParams) {
       ResolvedPayload rp{};
-      if (parseParamsMessage(pendingParams.line, &rp)) {
-        if (!rp.senderId.empty() && rp.senderId != app.currentSenderId) {
-          app.currentSenderId = rp.senderId;
-          lastParamsSeq = 0;
-          lastCloudSeq = 0;
-        }
+        if (parseParamsMessage(pendingParams.line, &rp)) {
+          if (!rp.senderId.empty() && rp.senderId != app.currentSenderId) {
+            app.currentSenderId = rp.senderId;
+            lastParamsSeq = 0;
+            lastCloudSeq = 0;
+            hasDeferredCloud = false;
+          }
         if (rp.seq < lastParamsSeq) {
           // Ignore stale param snapshots/deltas within the params stream.
         } else {
@@ -1077,6 +1084,16 @@ int runApp() {
               app.cam.panX = 0.0f;
               app.cam.panY = 0.0f;
             }
+            if (hasDeferredCloud && deferredCloud.seq >= lastCloudSeq &&
+                senderMatchesCurrent(app.currentSenderId, deferredCloud.senderId)) {
+              MeshData nextMesh{};
+              if (buildInputCloudMesh(deferredCloud, &nextMesh)) {
+                mesh = std::move(nextMesh);
+                lastCloudSeq = deferredCloud.seq;
+                hasDeferredCloud = false;
+                logViewerEvent("Applied deferred input cloud after params switched to input mode.");
+              }
+            }
           }
         }
       }
@@ -1084,13 +1101,21 @@ int runApp() {
     if (haveCloud) {
       InputCloudPayload cp{};
       if (parseInputCloudMessage(pendingCloud.line, &cp)) {
-        if (!app.currentSenderId.empty() && !cp.senderId.empty() && cp.senderId != app.currentSenderId) {
+        if (!senderMatchesCurrent(app.currentSenderId, cp.senderId)) {
           // Ignore clouds from a different OFX instance than the active sender.
-        } else if (cp.seq >= lastCloudSeq && app.currentSourceMode == "input") {
+          logViewerEvent("Ignored input cloud from non-active sender.");
+        } else if (cp.seq < lastCloudSeq) {
+          logViewerEvent("Ignored stale input cloud sequence.");
+        } else if (app.currentSourceMode != "input") {
+          deferredCloud = cp;
+          hasDeferredCloud = true;
+          logViewerEvent("Deferred input cloud until params confirm input mode.");
+        } else {
           MeshData nextMesh{};
           if (buildInputCloudMesh(cp, &nextMesh)) {
             mesh = std::move(nextMesh);
             lastCloudSeq = cp.seq;
+            hasDeferredCloud = false;
           }
         }
       }
