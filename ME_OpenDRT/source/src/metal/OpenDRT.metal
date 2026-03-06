@@ -452,3 +452,25 @@ kernel void OpenDRTKernel(device const float* src [[buffer(0)]],
   dst[iDst + 3] = src[iSrc + 3];
 }
 
+kernel void OpenDRTCopyKernel(device const float* src [[buffer(0)]],
+                              device float* dst [[buffer(1)]],
+                              constant OpenDRTParams& p [[buffer(2)]],
+                              constant OpenDRTDerivedParams& d [[buffer(5)]],
+                              constant int& width [[buffer(3)]],
+                              constant int& height [[buffer(4)]],
+                              constant int& srcRowFloats [[buffer(6)]],
+                              constant int& dstRowFloats [[buffer(7)]],
+                              uint2 gid [[thread_position_in_grid]]) {
+  (void)p;
+  (void)d;
+  const int x = static_cast<int>(gid.x);
+  const int y = static_cast<int>(gid.y);
+  if (x >= width || y >= height) return;
+  const int iSrc = y * srcRowFloats + x * 4;
+  const int iDst = y * dstRowFloats + x * 4;
+  dst[iDst + 0] = src[iSrc + 0];
+  dst[iDst + 1] = src[iSrc + 1];
+  dst[iDst + 2] = src[iSrc + 2];
+  dst[iDst + 3] = src[iSrc + 3];
+}
+
