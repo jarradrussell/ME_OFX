@@ -143,7 +143,7 @@ if(APPLE)
   add_custom_command(
     OUTPUT "${METAL_AIR}"
     # Use a broadly compatible Metal language version for Intel + Apple Silicon hosts.
-    COMMAND "${XCRUN_EXECUTABLE}" -sdk macosx metal -std=macos-metal2.4 -mmacosx-version-min=${METAL_MIN_OS} -c "${METAL_SRC}" -o "${METAL_AIR}"
+    COMMAND "${XCRUN_EXECUTABLE}" -sdk macosx metal -std=macos-metal2.4 -fmetal-math-mode=safe -fmetal-math-fp32-functions=precise -mmacosx-version-min=${METAL_MIN_OS} -c "${METAL_SRC}" -o "${METAL_AIR}"
     DEPENDS "${METAL_SRC}" "${CMAKE_CURRENT_SOURCE_DIR}/src/OpenDRTParams.h"
     VERBATIM
   )
@@ -192,6 +192,9 @@ if(APPLE)
   add_custom_command(TARGET ${PLUGIN_BASENAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${METAL_LIB}" "${OFX_RESOURCES_DIR}/OpenDRT.metallib"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" "${OFX_BUNDLE_CONTENTS_DIR}/Info.plist")
+  add_custom_command(TARGET ${PLUGIN_BASENAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/bundle/${PLUGIN_BASENAME}.ofx.bundle" "/Library/OFX/Plugins/${PLUGIN_BASENAME}.ofx.bundle"
+    COMMENT "Copying ${PLUGIN_BASENAME}.ofx.bundle to /Library/OFX/Plugins")
 endif()
 
 set_target_properties(${PLUGIN_BASENAME} PROPERTIES
@@ -292,6 +295,5 @@ if(ME_OPENDRT_BUILD_CUBE_VIEWER_STUB)
     )
   endif()
 endif()
-
 
 
